@@ -18,6 +18,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::core::HSTRING;
 
+use crate::logging::Level;
 use crate::api::{LogFn, MediaKey, PowerAction, VolumeChange, apply_volume, is_xml_char};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -77,10 +78,10 @@ fn suspend(hibernate: bool, log: &LogFn) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_secs(1));
             // При включённой гибернации SetSuspendState(FALSE) всё равно уходит в сон — это нормально.
             if unsafe { SetSuspendState(hibernate, false, false) } {
-                log(&format!("API: «{name}» — система вышла из состояния сна"));
+                log(Level::Info, &format!("API: «{name}» — система вышла из состояния сна"));
             } else {
                 let code = unsafe { windows::Win32::Foundation::GetLastError() };
-                log(&format!("API: «{name}» не выполнен — SetSuspendState вернул FALSE (GetLastError {})", code.0));
+                log(Level::Error, &format!("API: «{name}» не выполнен — SetSuspendState вернул FALSE (GetLastError {})", code.0));
             }
         })
         .map(|_| ())

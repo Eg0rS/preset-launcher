@@ -4,8 +4,57 @@
 //! (the currently active preset) and is written only by the engine, so the
 //! two never overwrite each other.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
+
+pub use crate::logging::Level as LogLevel;
+
+/// Тема оформления. Неизвестное значение в файле трактуется как `system`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeChoice {
+    pub const ALL: [ThemeChoice; 3] = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ThemeChoice {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Self::parse(&s).unwrap_or_default())
+    }
+}
+
+/// Акцент по умолчанию (зелёный маркер активного пресета).
+pub const DEFAULT_ACCENT: &str = "#3CC88A";
+
+/// Разбирает `#RRGGBB` (регистр любой, `#` обязателен).
+pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().strip_prefix('#')?;
+    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let v = u32::from_str_radix(h, 16).ok()?;
+    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+}
+
+pub fn format_hex_color(c: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -28,6 +77,14 @@ pub struct Settings {
     pub api_port: u16,
     /// Bearer-токен API. Пусто — генерируется при включении API.
     pub api_token: String,
+    /// Тема окна: "system" | "light" | "dark".
+    pub theme: ThemeChoice,
+    /// Акцентный цвет "#RRGGBB".
+    pub accent: String,
+    /// Глобальные горячие клавиши пресетов (по умолчанию выключены).
+    pub hotkeys_enabled: bool,
+    /// Уровень журнала: "error" | "info" | "debug".
+    pub log_level: LogLevel,
 }
 
 impl Default for Settings {
@@ -38,6 +95,10 @@ impl Default for Settings {
             api_enabled: false,
             api_port: 47800,
             api_token: String::new(),
+            theme: ThemeChoice::System,
+            accent: DEFAULT_ACCENT.into(),
+            hotkeys_enabled: false,
+            log_level: LogLevel::Info,
         }
     }
 }
@@ -53,8 +114,23 @@ pub fn generate_token() -> String {
 #[serde(default)]
 pub struct Preset {
     pub name: String,
+    /// Короткая метка (эмодзи или 1–2 символа). Пусто — без иконки.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    /// Цвет метки "#RRGGBB". Пусто — без цвета.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub color: String,
+    /// Глобальная горячая клавиша, например "Ctrl+Alt+1". Пусто — нет.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hotkey: String,
     #[serde(rename = "app")]
     pub apps: Vec<AppEntry>,
+}
+
+impl Preset {
+    pub fn new(name: impl Into<String>, apps: Vec<AppEntry>) -> Self {
+        Self { name: name.into(), apps, ..Default::default() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -388,8 +464,8 @@ pub fn default_config() -> Config {
     Config {
         settings: Settings::default(),
         presets: vec![
-            Preset { name: "Работа".into(), apps: vec![rider, datagrip, browser, telegram, terminal] },
-            Preset { name: "Игры".into(), apps: vec![discord, steam] },
+            Preset::new("Работа", vec![rider, datagrip, browser, telegram, terminal]),
+            Preset::new("Игры", vec![discord, steam]),
         ],
     }
 }
@@ -415,6 +491,76 @@ mod tests {
         assert_eq!(e.effective_process_name().as_deref(), Some("bar.exe"));
         let u = AppEntry { path: "steam://open/games".into(), ..Default::default() };
         assert_eq!(u.effective_process_name(), None);
+    }
+
+    #[test]
+    fn old_030_config_loads_with_defaults() {
+        let old = r#"
+[settings]
+close_timeout_secs = 7
+startup_preset = "Работа"
+api_enabled = true
+api_port = 47801
+api_token = "abc"
+
+[[preset]]
+name = "Работа"
+
+[[preset.app]]
+name = "Rider"
+path = "rider64.exe"
+"#;
+        let cfg: Config = toml::from_str(old).unwrap();
+        assert_eq!(cfg.settings.close_timeout_secs, 7);
+        assert_eq!(cfg.settings.api_token, "abc");
+        assert_eq!(cfg.settings.theme, ThemeChoice::System);
+        assert_eq!(cfg.settings.accent, DEFAULT_ACCENT);
+        assert!(!cfg.settings.hotkeys_enabled);
+        assert_eq!(cfg.settings.log_level, LogLevel::Info);
+        let p = &cfg.presets[0];
+        assert_eq!((p.icon.as_str(), p.color.as_str(), p.hotkey.as_str()), ("", "", ""));
+        assert_eq!(p.apps[0].name, "Rider");
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(empty.settings, Settings::default());
+    }
+
+    #[test]
+    fn new_fields_roundtrip_and_lenient_enums() {
+        let text = r##"
+[settings]
+theme = "dark"
+accent = "#112233"
+hotkeys_enabled = true
+log_level = "debug"
+
+[[preset]]
+name = "A"
+icon = "🎮"
+color = "#FF0000"
+hotkey = "Ctrl+Alt+1"
+"##;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.settings.theme, ThemeChoice::Dark);
+        assert_eq!(cfg.settings.log_level, LogLevel::Debug);
+        assert_eq!(cfg.presets[0].hotkey, "Ctrl+Alt+1");
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg, back);
+        let bad: Config = toml::from_str("[settings]\ntheme = \"neon\"\nlog_level = \"trace\"\n").unwrap();
+        assert_eq!(bad.settings.theme, ThemeChoice::System);
+        assert_eq!(bad.settings.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn hex_colors() {
+        assert_eq!(parse_hex_color("#FF8000"), Some([255, 128, 0]));
+        assert_eq!(parse_hex_color(" #3cc88a "), Some([0x3c, 0xc8, 0x8a]));
+        assert_eq!(parse_hex_color("3cc88a"), None);
+        assert_eq!(parse_hex_color("#fff"), None);
+        assert_eq!(parse_hex_color("#GG0000"), None);
+        assert_eq!(parse_hex_color("#+12345"), None);
+        assert_eq!(parse_hex_color("#ÿÿÿ"), None);
+        assert_eq!(format_hex_color([1, 2, 255]), "#0102FF");
+        assert_eq!(parse_hex_color(DEFAULT_ACCENT), Some([0x3c, 0xc8, 0x8a]));
     }
 
     #[test]

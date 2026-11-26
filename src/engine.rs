@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{self, AppEntry, Config, State};
+use crate::logging::{self, Level};
 use crate::winproc;
 
 const LOG_LINES: usize = 300;
@@ -44,6 +45,8 @@ pub struct Engine {
 
 impl Engine {
     pub fn start(cfg: Config, on_change: impl Fn() + Send + 'static) -> Self {
+        logging::rotate_on_start();
+        logging::set_filter(cfg.settings.log_level);
         let state = config::load_state();
         let shared = Arc::new(Mutex::new(Shared { active: state.active_preset, ..Default::default() }));
         let config = Arc::new(Mutex::new(cfg));
@@ -59,7 +62,7 @@ impl Engine {
                 .expect("spawn engine thread");
         }
         let log_shared = shared.clone();
-        let log: crate::api::LogFn = Arc::new(move |m: &str| push_log(&log_shared, m.to_string()));
+        let log: crate::api::LogFn = Arc::new(move |level: Level, m: &str| push_log(&log_shared, level, m.to_string()));
         let power_log = log.clone();
         let shutdown = Arc::new(crate::api::ShutdownTimer::new(
             Arc::new(move |action| crate::winsys::run_power(action, &power_log)),
@@ -75,6 +78,7 @@ impl Engine {
     }
 
     pub fn update_config(&self, cfg: Config) {
+        logging::set_filter(cfg.settings.log_level);
         *self.config.lock().unwrap() = cfg;
     }
 
@@ -83,8 +87,16 @@ impl Engine {
         self.config.lock().unwrap().presets.iter().map(|p| p.name.clone()).collect()
     }
 
+    pub fn log_at(&self, level: Level, msg: impl Into<String>) {
+        push_log(&self.shared, level, msg.into());
+    }
+
     pub fn log(&self, msg: impl Into<String>) {
-        push_log(&self.shared, msg.into());
+        self.log_at(Level::Info, msg);
+    }
+
+    pub fn log_error(&self, msg: impl Into<String>) {
+        self.log_at(Level::Error, msg);
     }
 }
 
@@ -177,7 +189,7 @@ fn worker(
         match cmd {
             Cmd::Switch(name, gen_id) => {
                 if skipped > 0 {
-                    push_log(&shared, format!("Пропущено устаревших команд переключения: {skipped}"));
+                    push_log(&shared, Level::Info, format!("Пропущено устаревших команд переключения: {skipped}"));
                 }
                 let cancelled = || generation.load(Ordering::SeqCst) != gen_id;
                 let cfg = config.lock().unwrap().clone();
@@ -198,7 +210,7 @@ fn worker(
                 }
                 if ok
                     && let Err(e) = config::save_state(&State { active_preset: Some(name) }) {
-                        push_log(&shared, format!("Не удалось сохранить состояние: {e}"));
+                        push_log(&shared, Level::Error, format!("Не удалось сохранить состояние: {e}"));
                     }
                 on_change();
             }
@@ -221,12 +233,12 @@ fn run_switch(
     cancelled: &dyn Fn() -> bool,
 ) -> bool {
     let Some(plan) = plan_switch(cfg, target) else {
-        push_log(shared, format!("Пресет «{target}» не найден"));
+        push_log(shared, Level::Error, format!("Пресет «{target}» не найден"));
         return false;
     };
-    push_log(shared, format!("── Пресет «{target}» ──"));
+    push_log(shared, Level::Info, format!("── Пресет «{target}» ──"));
     let abort = |shared: &Mutex<Shared>| {
-        push_log(shared, format!("Переключение на «{target}» прервано: пришла новая команда"));
+        push_log(shared, Level::Info, format!("Переключение на «{target}» прервано: пришла новая команда"));
         false
     };
 
@@ -241,7 +253,7 @@ fn run_switch(
         let name = app.display_name();
         let running = snapshot_has(app);
         if running && !app.launch_if_running {
-            push_log(shared, format!("{name}: уже запущен, пропускаю"));
+            push_log(shared, Level::Info, format!("{name}: уже запущен, пропускаю"));
             continue;
         }
         set_status(shared, on_change, format!("Запускаю {name}…"));
@@ -249,8 +261,8 @@ fn run_switch(
         let args = config::expand_env(&app.args);
         let dir = config::expand_env(app.working_dir.trim());
         match winproc::launch(&path, &args, &dir) {
-            Ok(()) => push_log(shared, format!("{name}: запущен")),
-            Err(e) => push_log(shared, format!("{name}: ошибка запуска — {e}")),
+            Ok(()) => push_log(shared, Level::Info, format!("{name}: запущен")),
+            Err(e) => push_log(shared, Level::Error, format!("{name}: ошибка запуска — {e}")),
         }
         if app.delay_ms > 0 && sleep_unless(Duration::from_millis(app.delay_ms), cancelled) {
             return abort(shared);
@@ -259,7 +271,7 @@ fn run_switch(
     if cancelled() {
         return abort(shared);
     }
-    push_log(shared, format!("Готово: «{target}»"));
+    push_log(shared, Level::Info, format!("Готово: «{target}»"));
     true
 }
 
@@ -296,7 +308,7 @@ fn close_programs(
             match winproc::run_close_command(cmd) {
                 Ok(()) => true,
                 Err(e) => {
-                    push_log(shared, format!("{}: команда закрытия не выполнилась — {e}", g.display));
+                    push_log(shared, Level::Error, format!("{}: команда закрытия не выполнилась — {e}", g.display));
                     winproc::post_close_to_windows(pids) > 0
                 }
             }
@@ -305,14 +317,14 @@ fn close_programs(
         };
 
         if asked {
-            push_log(shared, format!("{}: закрываю", g.display));
+            push_log(shared, Level::Debug, format!("{}: закрываю", g.display));
             pending.push(Pending { group: g, windowless_since: None });
         } else if g.force_kill {
             // No windows (sits in the tray) — nothing to ask politely.
             let n = pids.iter().filter(|&&p| winproc::kill(p)).count();
-            push_log(shared, format!("{}: нет окон, завершён принудительно ({n})", g.display));
+            push_log(shared, Level::Info, format!("{}: нет окон, завершён принудительно ({n})", g.display));
         } else {
-            push_log(shared, format!("{}: нет окон, принудительное завершение отключено — оставляю", g.display));
+            push_log(shared, Level::Info, format!("{}: нет окон, принудительное завершение отключено — оставляю", g.display));
         }
     }
 
@@ -325,7 +337,7 @@ fn close_programs(
         let snap = winproc::snapshot();
         pending.retain_mut(|p| {
             let Some(pids) = snap.get(&p.group.process) else {
-                push_log(shared, format!("{}: закрыт", p.group.display));
+                push_log(shared, Level::Debug, format!("{}: закрыт", p.group.display));
                 return false;
             };
             // Early kill for apps that just hid into the tray on WM_CLOSE.
@@ -334,7 +346,7 @@ fn close_programs(
                     let since = *p.windowless_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= WINDOWLESS_GRACE {
                         let n = pids.iter().filter(|&&pid| winproc::kill(pid)).count();
-                        push_log(shared, format!("{}: свернулся в трей, завершён принудительно ({n})", p.group.display));
+                        push_log(shared, Level::Info, format!("{}: свернулся в трей, завершён принудительно ({n})", p.group.display));
                         return false;
                     }
                 } else {
@@ -362,9 +374,9 @@ fn close_programs(
         let Some(pids) = snap.get(&p.group.process) else { continue };
         if p.group.force_kill {
             let n = pids.iter().filter(|&&pid| winproc::kill(pid)).count();
-            push_log(shared, format!("{}: не закрылся за {timeout_secs} с, завершён принудительно ({n})", p.group.display));
+            push_log(shared, Level::Info, format!("{}: не закрылся за {timeout_secs} с, завершён принудительно ({n})", p.group.display));
         } else {
-            push_log(shared, format!("{}: не закрылся за {timeout_secs} с, оставляю", p.group.display));
+            push_log(shared, Level::Info, format!("{}: не закрылся за {timeout_secs} с, оставляю", p.group.display));
         }
     }
     true
@@ -374,32 +386,17 @@ fn close_programs(
 // Logging
 // ---------------------------------------------------------------------------
 
-fn timestamp() -> String {
-    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
-}
-
-pub fn push_log(shared: &Mutex<Shared>, msg: String) {
-    let line = format!("{} {msg}", timestamp());
+pub fn push_log(shared: &Mutex<Shared>, level: Level, msg: String) {
+    if !logging::enabled(level) {
+        return;
+    }
+    let line = logging::format_line(&logging::timestamp(), level, &msg);
     #[cfg(not(test))]
-    append_log_file(&line);
+    logging::append_to_file(&line);
     let mut s = shared.lock().unwrap();
     s.log.push_back(line);
     while s.log.len() > LOG_LINES {
         s.log.pop_front();
-    }
-}
-
-#[cfg(not(test))]
-fn append_log_file(line: &str) {
-    use std::io::Write;
-    let path = config::app_dir().join("launcher.log");
-    if std::fs::metadata(&path).map(|m| m.len() > 1024 * 1024).unwrap_or(false) {
-        let _ = std::fs::rename(&path, path.with_extension("log.old"));
-    }
-    let _ = std::fs::create_dir_all(config::app_dir());
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{line}");
     }
 }
 
@@ -424,11 +421,8 @@ mod tests {
         Config {
             settings: Default::default(),
             presets: vec![
-                Preset {
-                    name: "Работа".into(),
-                    apps: vec![app("Rider", "rider64.exe"), app("Telegram", "telegram.exe"), explorer, keep_open, disabled],
-                },
-                Preset { name: "Игры".into(), apps: vec![app("Steam", "steam.exe"), tg_games] },
+                Preset::new("Работа", vec![app("Rider", "rider64.exe"), app("Telegram", "telegram.exe"), explorer, keep_open, disabled]),
+                Preset::new("Игры", vec![app("Steam", "steam.exe"), tg_games]),
             ],
         }
     }
@@ -477,7 +471,7 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         let cfg = Config {
             settings: Default::default(),
-            presets: vec![Preset { name: "P1".into(), apps: vec![nonexistent_app("FirstApp", 30_000), nonexistent_app("SecondApp", 0)] }],
+            presets: vec![Preset::new("P1", vec![nonexistent_app("FirstApp", 30_000), nonexistent_app("SecondApp", 0)])],
         };
         let shared = Arc::new(Mutex::new(Shared::default()));
         let flag = Arc::new(AtomicBool::new(false));
@@ -501,7 +495,7 @@ mod tests {
     fn uncancelled_switch_completes() {
         let cfg = Config {
             settings: Default::default(),
-            presets: vec![Preset { name: "P1".into(), apps: vec![nonexistent_app("FirstApp", 0), nonexistent_app("SecondApp", 0)] }],
+            presets: vec![Preset::new("P1", vec![nonexistent_app("FirstApp", 0), nonexistent_app("SecondApp", 0)])],
         };
         let shared = Mutex::new(Shared::default());
         assert!(run_switch(&cfg, "P1", &shared, &|| {}, &|| false));

@@ -7,8 +7,11 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::api::{self, ApiManager};
-use crate::config::{self, AppEntry, Config, Preset, State};
+use crate::config::{self, AppEntry, Config, Preset, State, ThemeChoice};
 use crate::engine::Engine;
+use crate::hotkeys::{self, Hotkeys};
+use crate::logging::{self, Level};
+use crate::theme;
 use crate::tray::{Tray, UiEvent};
 use crate::winproc;
 
@@ -32,6 +35,12 @@ pub struct LauncherApp {
     show_token: bool,
     local_ip: Option<std::net::IpAddr>,
     tray: Option<Tray>,
+    hotkeys: Hotkeys,
+    /// Редактируемый текст хоткея выбранного пресета (в конфиг попадает по мере ввода валидной строки).
+    hotkey_buf: String,
+    /// Применённые к egui (тема, акцент), чтобы не дёргать контекст каждый кадр.
+    applied_look: Option<(ThemeChoice, String)>,
+    accent: Color32,
     events: Receiver<UiEvent>,
     selected: usize,
     running: HashSet<String>,
@@ -42,7 +51,16 @@ pub struct LauncherApp {
 }
 
 impl LauncherApp {
-    pub fn new(cfg: Config, engine: Engine, api: ApiManager, tray: Option<Tray>, events: Receiver<UiEvent>, start_hidden: bool) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cfg: Config,
+        engine: Engine,
+        api: ApiManager,
+        tray: Option<Tray>,
+        hotkeys: Hotkeys,
+        events: Receiver<UiEvent>,
+        start_hidden: bool,
+    ) -> Self {
         let mut app = Self {
             hide_frames_left: if start_hidden { 3 } else { 0 },
             saved: cfg.clone(),
@@ -54,6 +72,10 @@ impl LauncherApp {
             show_token: false,
             local_ip: api::local_ip(),
             tray,
+            hotkeys,
+            hotkey_buf: String::new(),
+            applied_look: None,
+            accent: theme::accent_color(config::DEFAULT_ACCENT),
             events,
             selected: 0,
             running: HashSet::new(),
@@ -63,6 +85,7 @@ impl LauncherApp {
             && let Some(i) = app.cfg.presets.iter().position(|p| p.name == active) {
                 app.selected = i;
             }
+        app.hotkeys.apply(&app.cfg.settings, &app.cfg.presets, &app.engine);
         app.sync_tray();
         app
     }
@@ -72,7 +95,7 @@ impl LauncherApp {
             let s = self.engine.shared.lock().unwrap();
             (s.active.clone(), s.busy)
         };
-        let names = self.saved.presets.iter().map(|p| p.name.clone()).collect();
+        let names = self.saved.presets.iter().map(|p| (p.name.clone(), p.icon.clone())).collect();
         if let Some(t) = &mut self.tray {
             t.sync(names, active, busy);
         }
@@ -102,6 +125,7 @@ impl LauncherApp {
                 self.save_error = None;
                 self.engine.update_config(self.cfg.clone());
                 self.api.apply(&self.cfg.settings);
+                self.hotkeys.apply(&self.cfg.settings, &self.cfg.presets, &self.engine);
             }
             Err(e) => self.save_error = Some(format!("Не удалось сохранить конфиг: {e}")),
         }
@@ -140,7 +164,7 @@ impl LauncherApp {
             match &active {
                 Some(a) => {
                     ui.label("Активный пресет:");
-                    ui.label(RichText::new(a).strong().color(GREEN));
+                    ui.label(RichText::new(a).strong().color(self.accent));
                 }
                 None => {
                     ui.label(RichText::new("Пресет не выбран").weak());
@@ -175,11 +199,7 @@ impl LauncherApp {
         egui::ScrollArea::vertical().id_salt("presets_scroll").max_height(ui.available_height() - 80.0).show(ui, |ui| {
             for (i, p) in self.cfg.presets.iter().enumerate() {
                 let is_active = active.as_deref() == Some(p.name.as_str());
-                let label = if is_active {
-                    RichText::new(format!("● {}", p.name)).color(GREEN)
-                } else {
-                    RichText::new(format!("   {}", p.name))
-                };
+                let label = preset_label(ui, p, is_active, self.accent);
                 let resp = ui
                     .add_sized([ui.available_width(), 26.0], egui::Button::selectable(self.selected == i, label))
                     .on_hover_text("Двойной клик — включить пресет");
@@ -206,7 +226,7 @@ impl LauncherApp {
                     }
                     n += 1;
                 };
-                self.cfg.presets.push(Preset { name, apps: Vec::new() });
+                self.cfg.presets.push(Preset::new(name, Vec::new()));
                 self.selected = self.cfg.presets.len() - 1;
             }
             let has_sel = self.selected < self.cfg.presets.len();
@@ -271,6 +291,7 @@ impl LauncherApp {
             self.selected = idx.saturating_sub(1);
             return;
         }
+        self.preset_look_row(ui, idx);
 
         ui.label(
             RichText::new(
@@ -328,6 +349,70 @@ impl LauncherApp {
         }
     }
 
+    /// Иконка, цвет и горячая клавиша выбранного пресета.
+    fn preset_look_row(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let hotkeys_on = self.cfg.settings.hotkeys_enabled;
+        let accent = self.accent;
+        ui.horizontal_wrapped(|ui| {
+            let p = &mut self.cfg.presets[idx];
+            ui.label("Иконка:");
+            ui.add(egui::TextEdit::singleline(&mut p.icon).desired_width(48.0).char_limit(8).hint_text("🎮"))
+                .on_hover_text("Эмодзи или 1–2 символа; показывается в списке и в меню трея");
+            ui.add_space(8.0);
+            ui.label("Цвет:");
+            match config::parse_hex_color(&p.color) {
+                Some(mut rgb) => {
+                    if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
+                        p.color = config::format_hex_color(rgb);
+                    }
+                    if ui.small_button("✕").on_hover_text("Убрать цвет").clicked() {
+                        p.color.clear();
+                    }
+                }
+                None => {
+                    if ui.small_button("+ цвет").clicked() {
+                        let c = accent;
+                        p.color = config::format_hex_color([c.r(), c.g(), c.b()]);
+                    }
+                }
+            }
+            ui.add_space(8.0);
+            ui.label("Горячая клавиша:");
+        });
+        // Текст хоткея правится в буфере; в конфиг уходит пустая или корректная строка,
+        // чтобы промежуточный ввод не регистрировался и не засорял журнал.
+        let id = ui.make_persistent_id(("hotkey_edit", idx));
+        if !ui.memory(|m| m.has_focus(id)) {
+            self.hotkey_buf = self.cfg.presets[idx].hotkey.clone();
+        }
+        ui.horizontal(|ui| {
+            let resp = ui
+                .add(egui::TextEdit::singleline(&mut self.hotkey_buf).id(id).desired_width(180.0).hint_text("Ctrl+Alt+1"))
+                .on_hover_text("Например Ctrl+Alt+1, Ctrl+Shift+F5. Нужен хотя бы один модификатор.");
+            if resp.changed() {
+                let t = self.hotkey_buf.trim();
+                if t.is_empty() || hotkeys::parse_hotkey(t).is_ok() {
+                    self.cfg.presets[idx].hotkey = t.to_string();
+                }
+            }
+            if !hotkeys_on {
+                ui.label(RichText::new("выключено: включите «Горячие клавиши» внизу").weak().small());
+            }
+        });
+        let typed = self.hotkey_buf.trim();
+        let err = if hotkeys_on && !typed.is_empty() {
+            hotkeys::parse_hotkey(typed)
+                .err()
+                .or_else(|| self.hotkeys.error_for(&self.cfg.presets[idx].name).map(str::to_string))
+        } else {
+            None
+        };
+        if let Some(e) = err {
+            ui.label(RichText::new(format!("Горячая клавиша: {e}")).color(RED));
+        }
+        ui.add_space(2.0);
+    }
+
     fn api_block(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Удалённое управление").strong());
         ui.horizontal(|ui| {
@@ -372,6 +457,37 @@ impl LauncherApp {
         }
     }
 
+    fn look_block(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Внешний вид").strong());
+            ui.add_space(8.0);
+            ui.label("Тема:");
+            let label = |t: ThemeChoice| match t {
+                ThemeChoice::System => "Системная",
+                ThemeChoice::Light => "Светлая",
+                ThemeChoice::Dark => "Тёмная",
+            };
+            egui::ComboBox::from_id_salt("theme").selected_text(label(self.cfg.settings.theme)).show_ui(ui, |ui| {
+                for t in ThemeChoice::ALL {
+                    ui.selectable_value(&mut self.cfg.settings.theme, t, label(t));
+                }
+            });
+            ui.add_space(8.0);
+            ui.label("Акцент:");
+            let c = self.accent;
+            let mut rgb = [c.r(), c.g(), c.b()];
+            if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
+                self.cfg.settings.accent = config::format_hex_color(rgb);
+            }
+            if ui.small_button("Сброс").on_hover_text("Вернуть акцент по умолчанию").clicked() {
+                self.cfg.settings.accent = config::DEFAULT_ACCENT.to_string();
+            }
+            ui.add_space(16.0);
+            ui.checkbox(&mut self.cfg.settings.hotkeys_enabled, "Горячие клавиши пресетов")
+                .on_hover_text("Глобальные сочетания клавиш, заданные у пресетов. По умолчанию выключено.");
+        });
+    }
+
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -399,7 +515,24 @@ impl LauncherApp {
         ui.separator();
         self.api_block(ui);
         ui.separator();
-        ui.label(RichText::new("Журнал").strong());
+        self.look_block(ui);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Журнал").strong());
+            ui.add_space(8.0);
+            ui.label("Уровень:");
+            egui::ComboBox::from_id_salt("log_level").selected_text(self.cfg.settings.log_level.as_str()).show_ui(ui, |ui| {
+                for l in Level::ALL {
+                    ui.selectable_value(&mut self.cfg.settings.log_level, l, l.as_str());
+                }
+            });
+            if ui.button("Открыть журнал").on_hover_text(logging::log_path().display().to_string()).clicked() {
+                let path = logging::ensure_log_file();
+                if let Err(e) = winproc::launch(&path.to_string_lossy(), "", "") {
+                    self.engine.log_error(format!("Не удалось открыть журнал: {e}"));
+                }
+            }
+        });
         let log: Vec<String> = self.engine.shared.lock().unwrap().log.iter().cloned().collect();
         egui::ScrollArea::vertical()
             .id_salt("log_scroll")
@@ -411,6 +544,29 @@ impl LauncherApp {
                 }
             });
     }
+}
+
+/// Строка пресета в списке: маркер активного, цветная метка, иконка, название.
+fn preset_label(ui: &egui::Ui, p: &Preset, is_active: bool, accent: Color32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let base = ui.visuals().text_color();
+    let fmt = |color| TextFormat { font_id: font.clone(), color, ..Default::default() };
+    let mut job = LayoutJob::default();
+    if is_active {
+        job.append("● ", 0.0, fmt(accent));
+    } else {
+        job.append("   ", 0.0, fmt(base));
+    }
+    if let Some([r, g, b]) = config::parse_hex_color(&p.color) {
+        job.append("■ ", 0.0, fmt(Color32::from_rgb(r, g, b)));
+    }
+    let icon = p.icon.trim();
+    if !icon.is_empty() {
+        job.append(&format!("{icon} "), 0.0, fmt(base));
+    }
+    job.append(&p.name, 0.0, fmt(if is_active { accent } else { base }));
+    job
 }
 
 /// One program row. Returns a reorder/remove action if requested.
@@ -519,8 +675,18 @@ impl eframe::App for LauncherApp {
                     Self::show_window(ctx)
                 }
                 UiEvent::Switch(name) => self.engine.switch(&name),
+                UiEvent::Hotkey(name) => {
+                    self.engine.log(format!("Горячая клавиша: переключение на «{name}»"));
+                    self.engine.switch(&name);
+                }
                 UiEvent::Quit => self.quit(),
             }
+        }
+        let look = (self.cfg.settings.theme, self.cfg.settings.accent.clone());
+        if self.applied_look.as_ref() != Some(&look) {
+            self.accent = theme::accent_color(&look.1);
+            theme::apply(ctx, look.0, self.accent);
+            self.applied_look = Some(look);
         }
         if ctx.input(|i| i.viewport().close_requested()) {
             // The window's X button hides to tray; "Выход" really quits.

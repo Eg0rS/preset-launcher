@@ -2,7 +2,7 @@
 ; Build: .\build-installer.ps1  (runs cargo build --release, then ISCC)
 
 #define AppName "Preset Launcher"
-#define AppVersion "0.3.0"
+#define AppVersion "0.4.0"
 #define AppExe "preset-launcher.exe"
 
 [Setup]

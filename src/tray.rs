@@ -11,6 +11,8 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 pub enum UiEvent {
     Show,
     Switch(String),
+    /// Нажата глобальная горячая клавиша пресета.
+    Hotkey(String),
     Quit,
 }
 
@@ -59,11 +61,17 @@ fn load_icon() -> Option<Icon> {
         .or_else(|| Icon::from_rgba(crate::icon_art::render_icon_rgba(32), 32, 32).ok())
 }
 
-fn build_menu(presets: &[String], active: Option<&str>, busy: bool) -> Menu {
+/// Подпись пункта меню: иконка пресета (если есть) перед названием.
+pub fn menu_label(name: &str, icon: &str) -> String {
+    let icon = icon.trim();
+    if icon.is_empty() { name.to_string() } else { format!("{icon} {name}") }
+}
+
+fn build_menu(presets: &[(String, String)], active: Option<&str>, busy: bool) -> Menu {
     let menu = Menu::new();
-    for name in presets {
+    for (name, icon) in presets {
         let checked = active == Some(name.as_str());
-        let item = CheckMenuItem::with_id(format!("{PRESET_PREFIX}{name}"), name, !busy, checked, None);
+        let item = CheckMenuItem::with_id(format!("{PRESET_PREFIX}{name}"), menu_label(name, icon), !busy, checked, None);
         let _ = menu.append(&item);
     }
     if !presets.is_empty() {
@@ -82,9 +90,12 @@ fn tooltip(active: Option<&str>, busy: bool) -> String {
     }
 }
 
+/// (пресеты: имя и иконка, активный пресет, занят ли движок)
+type TrayKey = (Vec<(String, String)>, Option<String>, bool);
+
 pub struct Tray {
     icon: TrayIcon,
-    last: Option<(Vec<String>, Option<String>, bool)>,
+    last: Option<TrayKey>,
 }
 
 impl Tray {
@@ -100,7 +111,7 @@ impl Tray {
     }
 
     /// Rebuilds menu/tooltip only when something visible changed.
-    pub fn sync(&mut self, presets: Vec<String>, active: Option<String>, busy: bool) {
+    pub fn sync(&mut self, presets: Vec<(String, String)>, active: Option<String>, busy: bool) {
         let key = (presets, active, busy);
         if self.last.as_ref() == Some(&key) {
             return;
@@ -109,5 +120,17 @@ impl Tray {
         self.icon.set_menu(Some(Box::new(build_menu(presets, active.as_deref(), *busy))));
         let _ = self.icon.set_tooltip(Some(tooltip(active.as_deref(), *busy)));
         self.last = Some(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::menu_label;
+
+    #[test]
+    fn menu_label_prefixes_icon() {
+        assert_eq!(menu_label("Игры", "🎮"), "🎮 Игры");
+        assert_eq!(menu_label("Игры", "  "), "Игры");
+        assert_eq!(menu_label("Работа", ""), "Работа");
     }
 }

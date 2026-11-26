@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::config::Settings;
 use crate::engine::Engine;
+use crate::logging::Level;
 
 const MAX_BODY: usize = 16 * 1024;
 const DEFAULT_POWER_DELAY: u64 = 10;
@@ -109,7 +110,7 @@ pub trait Backend: Send + Sync {
     fn set_volume(&self, change: VolumeChange) -> Result<(u8, bool), String>;
     fn media(&self, key: MediaKey) -> Result<(), String>;
     fn notify(&self, title: &str, message: &str) -> Result<(), String>;
-    fn log(&self, msg: &str);
+    fn log(&self, level: Level, msg: &str);
 }
 
 impl Backend for Engine {
@@ -152,14 +153,14 @@ impl Backend for Engine {
             .spawn(move || {
                 let _slot = _slot;
                 if let Err(e) = crate::winsys::show_toast(&title, &message) {
-                    Engine::log(&engine, format!("API: уведомление не показано — {e}"));
+                    Engine::log_error(&engine, format!("API: уведомление не показано — {e}"));
                 }
             })
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
-    fn log(&self, msg: &str) {
-        Engine::log(self, msg);
+    fn log(&self, level: Level, msg: &str) {
+        Engine::log_at(self, level, msg);
     }
 }
 
@@ -168,7 +169,7 @@ impl Backend for Engine {
 // ---------------------------------------------------------------------------
 
 type ExecFn = Arc<dyn Fn(PowerAction) -> Result<(), String> + Send + Sync>;
-pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
+pub type LogFn = Arc<dyn Fn(Level, &str) + Send + Sync>;
 
 /// Значение `Err` из `Backend::notify`, означающее «слишком много показов тостов сразу» (-> 503).
 pub const NOTIFY_BUSY: &str = "busy";
@@ -244,17 +245,17 @@ fn run_exec(exec: &ExecFn, log: &LogFn, action: PowerAction) -> Result<(), Strin
     match exec(action) {
         Ok(()) => {
             if action == PowerAction::Shutdown {
-                log("API: shutdown.exe /s /t 0 выполнен, ПК выключается");
+                log(Level::Info, "API: shutdown.exe /s /t 0 выполнен, ПК выключается");
             } else if matches!(action, PowerAction::Sleep | PowerAction::Hibernate) {
                 // Итог SetSuspendState пишет сам поток в winsys (после пробуждения).
-                log(&format!("API: действие питания «{}» запущено", action.name()));
+                log(Level::Info, &format!("API: действие питания «{}» запущено", action.name()));
             } else {
-                log(&format!("API: действие питания «{}» выполнено", action.name()));
+                log(Level::Info, &format!("API: действие питания «{}» выполнено", action.name()));
             }
             Ok(())
         }
         Err(e) => {
-            log(&format!("API: не удалось выполнить действие питания «{}» — {e}", action.name()));
+            log(Level::Error, &format!("API: не удалось выполнить действие питания «{}» — {e}", action.name()));
             Err(e)
         }
     }
@@ -334,30 +335,30 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
                 return err(404, "unknown preset");
             }
             if backend.cancel_shutdown() {
-                backend.log("API: отложенное действие питания отменено (пришла команда переключения)");
+                backend.log(Level::Info, "API: отложенное действие питания отменено (пришла команда переключения)");
             }
-            backend.log(&format!("API: переключение на «{name}»"));
+            backend.log(Level::Info, &format!("API: переключение на «{name}»"));
             backend.switch(name);
             resp(202, json!({ "accepted": true, "preset": name }))
         }
         ("POST", "/api/shutdown") => {
             let Some(delay) = parse_shutdown_delay(req.body) else { return err(400, "bad request") };
-            backend.log(&format!("API: запрошено выключение ПК через {delay} с"));
+            backend.log(Level::Info, &format!("API: запрошено выключение ПК через {delay} с"));
             match backend.power(PowerAction::Shutdown, delay) {
                 Ok(()) => resp(202, json!({ "accepted": true, "delay_secs": delay })),
                 Err(e) => {
-                    backend.log(&format!("API: выключение не выполнено — {e}"));
+                    backend.log(Level::Error, &format!("API: выключение не выполнено — {e}"));
                     err(500, "shutdown failed")
                 }
             }
         }
         ("POST", "/api/power") => {
             let Some((action, delay)) = parse_power(req.body) else { return err(400, "bad request") };
-            backend.log(&format!("API: запрошено действие питания «{}» через {delay} с", action.name()));
+            backend.log(Level::Info, &format!("API: запрошено действие питания «{}» через {delay} с", action.name()));
             match backend.power(action, delay) {
                 Ok(()) => resp(202, json!({ "accepted": true, "action": action.name(), "delay_secs": delay })),
                 Err(e) => {
-                    backend.log(&format!("API: действие питания «{}» не выполнено — {e}", action.name()));
+                    backend.log(Level::Error, &format!("API: действие питания «{}» не выполнено — {e}", action.name()));
                     err(500, "power failed")
                 }
             }
@@ -365,7 +366,7 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
         ("POST", "/api/shutdown/cancel") => {
             let cancelled = backend.cancel_shutdown();
             if cancelled {
-                backend.log("API: отложенное действие питания отменено");
+                backend.log(Level::Info, "API: отложенное действие питания отменено");
             }
             resp(200, json!({ "cancelled": cancelled }))
         }
@@ -374,7 +375,7 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
             match backend.set_volume(change) {
                 Ok((volume, muted)) => resp(200, json!({ "volume": volume, "muted": muted })),
                 Err(e) => {
-                    backend.log(&format!("API: громкость не изменена — {e}"));
+                    backend.log(Level::Error, &format!("API: громкость не изменена — {e}"));
                     err(500, "volume failed")
                 }
             }
@@ -384,7 +385,7 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
             match backend.media(key) {
                 Ok(()) => resp(200, json!({ "ok": true })),
                 Err(e) => {
-                    backend.log(&format!("API: медиаклавиша не отправлена — {e}"));
+                    backend.log(Level::Error, &format!("API: медиаклавиша не отправлена — {e}"));
                     err(500, "media failed")
                 }
             }
@@ -395,7 +396,7 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
                 Ok(()) => resp(202, json!({ "accepted": true })),
                 Err(e) if e == NOTIFY_BUSY => err(503, "busy"),
                 Err(e) => {
-                    backend.log(&format!("API: уведомление не показано — {e}"));
+                    backend.log(Level::Error, &format!("API: уведомление не показано — {e}"));
                     err(500, "notify failed")
                 }
             }
@@ -576,9 +577,18 @@ pub fn start(bind: &str, token: Arc<Mutex<String>>, backend: Arc<dyn Backend>) -
     Ok(Running { server, thread: Some(thread), addr })
 }
 
+/// Обрабатывает запрос и пишет в журнал (debug) метод, путь без query и код ответа.
+/// Токен и тело запроса в журнал не попадают.
 fn serve_one(request: &mut tiny_http::Request, token: &Mutex<String>, backend: &dyn Backend) -> Response {
     let method = request.method().as_str().to_string();
     let path = request.url().to_string();
+    let response = serve_inner(request, &method, &path, token, backend);
+    let log_path = path.split('?').next().unwrap_or("");
+    backend.log(Level::Debug, &format!("API: {method} {log_path} -> {}", response.status));
+    response
+}
+
+fn serve_inner(request: &mut tiny_http::Request, method: &str, path: &str, token: &Mutex<String>, backend: &dyn Backend) -> Response {
     let auth = request
         .headers()
         .iter()
@@ -602,7 +612,7 @@ fn serve_one(request: &mut tiny_http::Request, token: &Mutex<String>, backend: &
     if request.body_length().is_some_and(|n| n != body.len()) {
         return err(400, "bad request");
     }
-    handle(&Request { method: &method, path: &path, auth: auth.as_deref(), body: &body }, &token, backend)
+    handle(&Request { method, path, auth: auth.as_deref(), body: &body }, &token, backend)
 }
 
 // ---------------------------------------------------------------------------
@@ -633,7 +643,7 @@ impl ApiManager {
         self.applied = Some(want);
         if let Some(r) = self.running.take() {
             r.stop();
-            self.backend.log("API: остановлен");
+            self.backend.log(Level::Info, "API: остановлен");
         }
         self.error = None;
         if !s.api_enabled {
@@ -641,12 +651,12 @@ impl ApiManager {
         }
         match start(&format!("0.0.0.0:{}", s.api_port), self.token.clone(), self.backend.clone()) {
             Ok(r) => {
-                self.backend.log(&format!("API: слушаю порт {}", r.addr.port()));
+                self.backend.log(Level::Info, &format!("API: слушаю порт {}", r.addr.port()));
                 self.running = Some(r);
             }
             Err(e) => {
                 let msg = format!("API: не удалось занять порт {} — {e}", s.api_port);
-                self.backend.log(&msg);
+                self.backend.log(Level::Error, &msg);
                 self.error = Some(msg);
             }
         }
@@ -754,7 +764,7 @@ mod tests {
             self.notifications.lock().unwrap().push((t.into(), m.into()));
             if self.fail_misc.load(Ordering::SeqCst) { Err("boom".into()) } else { Ok(()) }
         }
-        fn log(&self, _: &str) {}
+        fn log(&self, _: Level, _: &str) {}
     }
 
     fn call(f: &Fake, method: &str, path: &str, auth: Option<&str>, body: &str) -> (u16, Value) {
@@ -890,7 +900,7 @@ mod tests {
                 r.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }),
-            Arc::new(move |m: &str| l.lock().unwrap().push(m.to_string())),
+            Arc::new(move |_: Level, m: &str| l.lock().unwrap().push(m.to_string())),
         );
         (Arc::new(t), runs, logs)
     }
@@ -935,7 +945,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert!(t.pending_action().is_none()); // отложенное заменено немедленным
 
-        let failing = ShutdownTimer::new(Arc::new(|_| Err("denied".to_string())), Arc::new(|_: &str| {}));
+        let failing = ShutdownTimer::new(Arc::new(|_| Err("denied".to_string())), Arc::new(|_: Level, _: &str| {}));
         assert_eq!(failing.schedule_after(PowerAction::Shutdown, Duration::ZERO), Err("denied".to_string()));
     }
 
@@ -1149,7 +1159,7 @@ mod tests {
             fn set_volume(&self, c: VolumeChange) -> Result<(u8, bool), String> { self.0.set_volume(c) }
             fn media(&self, k: MediaKey) -> Result<(), String> { self.0.media(k) }
             fn notify(&self, _: &str, _: &str) -> Result<(), String> { Err(NOTIFY_BUSY.to_string()) }
-            fn log(&self, _: &str) {}
+            fn log(&self, _: Level, _: &str) {}
         }
         let b = Busy(Fake::default());
         let r = handle(&Request { method: "POST", path: "/api/notify", auth: OK, body: br#"{"title":"a","message":"b"}"# }, "secret", &b);
@@ -1180,7 +1190,7 @@ mod tests {
                 s2.lock().unwrap().push(a);
                 Ok(())
             }),
-            Arc::new(|_: &str| {}),
+            Arc::new(|_: Level, _: &str| {}),
         );
         t.schedule_after(PowerAction::Sleep, Duration::from_millis(150)).unwrap();
         assert_eq!(t.pending_action(), Some(PowerAction::Sleep));

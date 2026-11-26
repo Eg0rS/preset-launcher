@@ -3,8 +3,11 @@
 mod api;
 mod config;
 mod engine;
+mod hotkeys;
 mod icon_art;
+mod logging;
 mod single;
+mod theme;
 mod tray;
 mod ui;
 mod winproc;
@@ -40,7 +43,7 @@ fn setup_style(ctx: &egui::Context) {
             }],
         ));
     }
-    ctx.global_style_mut(|s| {
+    ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         s.spacing.button_padding = egui::vec2(10.0, 4.0);
         s.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.5));
@@ -88,9 +91,11 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             setup_style(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx, cfg.settings.theme, theme::accent_color(&cfg.settings.accent));
 
             let (tx, rx) = channel();
             tray::install_handlers(tx.clone(), cc.egui_ctx.clone());
+            let hotkeys = hotkeys::Hotkeys::new(tx.clone(), cc.egui_ctx.clone());
             {
                 let ctx = cc.egui_ctx.clone();
                 instance.watch(move || {
@@ -108,7 +113,7 @@ fn main() -> eframe::Result {
             let repaint_ctx = cc.egui_ctx.clone();
             let engine = engine::Engine::start(cfg.clone(), move || repaint_ctx.request_repaint());
             if let Some(err) = load_error {
-                engine.log(err);
+                engine.log_error(err);
             }
 
             let mut api = api::ApiManager::new(engine.clone());
@@ -117,7 +122,7 @@ fn main() -> eframe::Result {
             let tray = match tray::Tray::new() {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    engine.log(format!("Не удалось создать значок в трее: {e}"));
+                    engine.log_error(format!("Не удалось создать значок в трее: {e}"));
                     None
                 }
             };
@@ -131,7 +136,7 @@ fn main() -> eframe::Result {
                 }
             }
 
-            Ok(Box::new(ui::LauncherApp::new(cfg, engine, api, tray, rx, minimized)))
+            Ok(Box::new(ui::LauncherApp::new(cfg, engine, api, tray, hotkeys, rx, minimized)))
         }),
     )
 }
