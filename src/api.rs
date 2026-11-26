@@ -1332,11 +1332,23 @@ mod tests {
                 c
             })
             .collect();
-        thread::sleep(Duration::from_millis(500));
-        let (s, _) = http(a, STATUS_REQ);
+        // Ждём, пока сервер разберёт все зависшие запросы и займёт слоты: фиксированная пауза
+        // нестабильна на медленных CI-раннерах. Пока слот свободен, STATUS_REQ отвечает 200 и слот освобождает.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut s = 0;
+        while Instant::now() < deadline {
+            s = http(a, STATUS_REQ).0;
+            if s == 503 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
         assert_eq!(s, 503);
         drop(hung);
-        thread::sleep(Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && http(a, STATUS_REQ).0 != 200 {
+            thread::sleep(Duration::from_millis(100));
+        }
         assert_eq!(http(a, STATUS_REQ).0, 200);
         running.stop();
     }
