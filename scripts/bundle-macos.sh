@@ -75,7 +75,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 if [[ ${#BINS[@]} -gt 1 ]]; then
   echo "==> lipo: universal binary"
   lipo -create "${BINS[@]}" -output "$APP/Contents/MacOS/$BIN_NAME"
-  lipo -verify_arch "$APP/Contents/MacOS/$BIN_NAME" arm64 x86_64
+  lipo "$APP/Contents/MacOS/$BIN_NAME" -verify_arch arm64 x86_64
 else
   if [[ "$RELEASE" == "1" ]]; then
     echo "RELEASE=1: получена сборка только под одну архитектуру." >&2
