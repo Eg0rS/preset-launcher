@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, AppEntry, Config, State};
 use crate::logging::{self, Level};
-use crate::winproc;
+use crate::platform;
 
 const LOG_LINES: usize = 300;
 const POLL: Duration = Duration::from_millis(300);
@@ -65,7 +65,7 @@ impl Engine {
         let log: crate::api::LogFn = Arc::new(move |level: Level, m: &str| push_log(&log_shared, level, m.to_string()));
         let power_log = log.clone();
         let shutdown = Arc::new(crate::api::ShutdownTimer::new(
-            Arc::new(move |action| crate::winsys::run_power(action, &power_log)),
+            Arc::new(move |action| crate::platform::run_power(action, &power_log)),
             log,
         ));
         Self { tx, shared, config, generation, submit: Arc::new(Mutex::new(())), shutdown }
@@ -132,7 +132,7 @@ pub fn plan_switch(cfg: &Config, target: &str) -> Option<Plan> {
     for preset in cfg.presets.iter().filter(|p| p.name != target) {
         for app in preset.apps.iter().filter(|a| a.enabled && a.close_on_switch) {
             let Some(proc_name) = app.effective_process_name() else { continue };
-            if keep.contains(&proc_name) || winproc::is_protected(&proc_name) || !seen.insert(proc_name.clone()) {
+            if keep.contains(&proc_name) || platform::is_protected(&proc_name) || !seen.insert(proc_name.clone()) {
                 continue;
             }
             let cc = config::expand_env(app.close_command.trim());
@@ -251,7 +251,10 @@ fn run_switch(
             return abort(shared);
         }
         let name = app.display_name();
-        let running = snapshot_has(app);
+        let Some(running) = snapshot_has(app) else {
+            push_log(shared, Level::Error, format!("{name}: не удалось получить список процессов, запуск пропущен"));
+            continue;
+        };
         if running && !app.launch_if_running {
             push_log(shared, Level::Info, format!("{name}: уже запущен, пропускаю"));
             continue;
@@ -260,7 +263,7 @@ fn run_switch(
         let path = config::expand_env(app.path.trim());
         let args = config::expand_env(&app.args);
         let dir = config::expand_env(app.working_dir.trim());
-        match winproc::launch(&path, &args, &dir) {
+        match platform::launch(&path, &args, &dir) {
             Ok(()) => push_log(shared, Level::Info, format!("{name}: запущен")),
             Err(e) => push_log(shared, Level::Error, format!("{name}: ошибка запуска — {e}")),
         }
@@ -275,10 +278,11 @@ fn run_switch(
     true
 }
 
-fn snapshot_has(app: &AppEntry) -> bool {
+/// `None` — список процессов получить не удалось (тогда не запускаем, чтобы не плодить дубликаты).
+fn snapshot_has(app: &AppEntry) -> Option<bool> {
     match app.effective_process_name() {
-        Some(p) => winproc::snapshot().contains_key(&p),
-        None => false,
+        Some(p) => platform::snapshot().map(|s| s.contains_key(&p)),
+        None => Some(false),
     }
 }
 
@@ -295,7 +299,10 @@ fn close_programs(
     on_change: &dyn Fn(),
     cancelled: &dyn Fn() -> bool,
 ) -> bool {
-    let snap = winproc::snapshot();
+    let Some(snap) = platform::snapshot() else {
+        push_log(shared, Level::Error, "Не удалось получить список процессов: закрытие программ пропущено".to_string());
+        return true;
+    };
     let mut pending: Vec<Pending> = Vec::new();
 
     for g in groups {
@@ -305,15 +312,15 @@ fn close_programs(
         let Some(pids) = snap.get(&g.process) else { continue };
         set_status(shared, on_change, format!("Закрываю {}…", g.display));
         let asked = if let Some(cmd) = &g.close_command {
-            match winproc::run_close_command(cmd) {
+            match platform::run_close_command(cmd) {
                 Ok(()) => true,
                 Err(e) => {
                     push_log(shared, Level::Error, format!("{}: команда закрытия не выполнилась — {e}", g.display));
-                    winproc::post_close_to_windows(pids) > 0
+                    platform::post_close_to_windows(pids) > 0
                 }
             }
         } else {
-            winproc::post_close_to_windows(pids) > 0
+            platform::post_close_to_windows(pids) > 0
         };
 
         if asked {
@@ -321,7 +328,7 @@ fn close_programs(
             pending.push(Pending { group: g, windowless_since: None });
         } else if g.force_kill {
             // No windows (sits in the tray) — nothing to ask politely.
-            let n = pids.iter().filter(|&&p| winproc::kill(p)).count();
+            let n = pids.iter().filter(|&&p| platform::kill(p)).count();
             push_log(shared, Level::Info, format!("{}: нет окон, завершён принудительно ({n})", g.display));
         } else {
             push_log(shared, Level::Info, format!("{}: нет окон, принудительное завершение отключено — оставляю", g.display));
@@ -334,7 +341,16 @@ fn close_programs(
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        let snap = winproc::snapshot();
+        let Some(snap) = platform::snapshot() else {
+            // Состояние неизвестно: не считаем программы закрытыми и не завершаем их.
+            if Instant::now() >= deadline {
+                break;
+            }
+            if sleep_unless(POLL, cancelled) {
+                return false;
+            }
+            continue;
+        };
         pending.retain_mut(|p| {
             let Some(pids) = snap.get(&p.group.process) else {
                 push_log(shared, Level::Debug, format!("{}: закрыт", p.group.display));
@@ -342,10 +358,10 @@ fn close_programs(
             };
             // Early kill for apps that just hid into the tray on WM_CLOSE.
             if p.group.force_kill && p.group.close_command.is_none() {
-                if winproc::visible_window_count(pids) == 0 {
+                if platform::visible_window_count(pids) == 0 {
                     let since = *p.windowless_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= WINDOWLESS_GRACE {
-                        let n = pids.iter().filter(|&&pid| winproc::kill(pid)).count();
+                        let n = pids.iter().filter(|&&pid| platform::kill(pid)).count();
                         push_log(shared, Level::Info, format!("{}: свернулся в трей, завершён принудительно ({n})", p.group.display));
                         return false;
                     }
@@ -369,11 +385,14 @@ fn close_programs(
     if cancelled() {
         return false;
     }
-    let snap = winproc::snapshot();
+    let Some(snap) = platform::snapshot() else {
+        push_log(shared, Level::Error, "Не удалось получить список процессов: принудительное завершение пропущено".to_string());
+        return true;
+    };
     for p in pending {
         let Some(pids) = snap.get(&p.group.process) else { continue };
         if p.group.force_kill {
-            let n = pids.iter().filter(|&&pid| winproc::kill(pid)).count();
+            let n = pids.iter().filter(|&&pid| platform::kill(pid)).count();
             push_log(shared, Level::Info, format!("{}: не закрылся за {timeout_secs} с, завершён принудительно ({n})", p.group.display));
         } else {
             push_log(shared, Level::Info, format!("{}: не закрылся за {timeout_secs} с, оставляю", p.group.display));
@@ -405,14 +424,21 @@ mod tests {
     use super::*;
     use crate::config::Preset;
 
+    // Имя процесса задаётся явно: вывод имени из пути зависит от ОС.
     fn app(name: &str, proc_: &str) -> AppEntry {
-        AppEntry { name: name.into(), path: format!("C:\\{proc_}"), ..Default::default() }
+        AppEntry { name: name.into(), path: format!("apps/{proc_}"), process_name: proc_.into(), ..Default::default() }
     }
+
+    /// Процесс, который на текущей ОС защищён от закрытия.
+    #[cfg(windows)]
+    const PROTECTED_PROC: &str = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    const PROTECTED_PROC: &str = "finder";
 
     fn cfg() -> Config {
         let mut tg_games = app("Telegram", "Telegram.exe");
         tg_games.close_on_switch = true;
-        let mut explorer = app("Explorer", "explorer.exe");
+        let mut explorer = app("Explorer", PROTECTED_PROC);
         explorer.close_on_switch = true;
         let mut keep_open = app("Music", "music.exe");
         keep_open.close_on_switch = false;
@@ -451,7 +477,11 @@ mod tests {
     }
 
     fn nonexistent_app(name: &str, delay_ms: u64) -> AppEntry {
-        AppEntry { name: name.into(), path: format!("C:\\definitely-missing-dir\\{name}.exe"), delay_ms, ..Default::default() }
+        #[cfg(windows)]
+        let path = format!("C:\\definitely-missing-dir\\{name}.exe");
+        #[cfg(target_os = "macos")]
+        let path = format!("/definitely-missing-dir/{name}");
+        AppEntry { name: name.into(), path, delay_ms, ..Default::default() }
     }
 
     #[test]
@@ -500,6 +530,12 @@ mod tests {
         let shared = Mutex::new(Shared::default());
         assert!(run_switch(&cfg, "P1", &shared, &|| {}, &|| false));
         assert!(log_text(&shared).contains("SecondApp"));
+    }
+
+    #[test]
+    fn platform_protects_system_shell() {
+        assert!(platform::is_protected(PROTECTED_PROC));
+        assert!(!platform::is_protected("definitely-not-protected"));
     }
 
     #[test]

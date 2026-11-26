@@ -1,4 +1,5 @@
-//! Config model + persistence (%APPDATA%\PresetLauncher\config.toml).
+//! Config model + persistence (`%APPDATA%\PresetLauncher\config.toml` on Windows,
+//! `~/Library/Application Support/PresetLauncher/config.toml` on macOS).
 //!
 //! `config.toml` is edited by the UI; `state.toml` holds runtime state
 //! (the currently active preset) and is written only by the engine, so the
@@ -188,8 +189,7 @@ impl AppEntry {
         if path.contains("://") {
             return None; // URL — no process to track
         }
-        let file = Path::new(&path).file_name()?.to_string_lossy().to_lowercase();
-        if file.ends_with(".exe") { Some(file) } else { None }
+        crate::platform::process_name_from_path(&path)
     }
 
     pub fn display_name(&self) -> String {
@@ -215,8 +215,7 @@ pub fn app_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PRESET_LAUNCHER_DIR") {
         return PathBuf::from(dir);
     }
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("PresetLauncher")
+    crate::platform::config_base_dir().join("PresetLauncher")
 }
 
 fn config_path() -> PathBuf {
@@ -234,6 +233,15 @@ fn pending_switch_path() -> PathBuf {
 /// Hand-off of a `--preset NAME` request from a second instance to the running one.
 pub fn write_pending_switch(name: &str) -> anyhow::Result<()> {
     write_atomic(&pending_switch_path(), name)
+}
+
+/// Удаляет запрос переключения, оставшийся от прошлого запуска: только если файл старше `t`
+/// (по mtime); свежий запрос второго экземпляра сохраняется.
+pub fn discard_pending_switch_older_than(t: std::time::SystemTime) {
+    let path = pending_switch_path();
+    if std::fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|m| m < t) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 pub fn take_pending_switch() -> Option<String> {
@@ -254,12 +262,13 @@ pub fn load_config() -> (Config, Option<String>) {
             Ok(cfg) => (cfg, None),
             Err(e) => {
                 let backup = path.with_extension("toml.broken");
-                let _ = std::fs::copy(&path, &backup);
+                let _ = write_private(&backup, text.as_bytes());
                 (
                     default_config(),
                     Some(format!(
-                        "Не удалось прочитать {}: {e}. Копия сохранена в {}, загружены пресеты по умолчанию.",
+                        "Не удалось прочитать {}: {}. Копия сохранена в {}, загружены пресеты по умолчанию.",
                         path.display(),
+                        toml_error_brief(&text, &e),
                         backup.display()
                     )),
                 )
@@ -271,6 +280,14 @@ pub fn load_config() -> (Config, Option<String>) {
             (cfg, err)
         }
     }
+}
+
+/// Читает конфиг без побочных эффектов (для CLI): ничего не создаёт и не переименовывает.
+pub fn read_config() -> Result<Config, String> {
+    let path = config_path();
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("не удалось прочитать конфиг {} ({e}): запустите приложение хотя бы один раз", path.display()))?;
+    toml::from_str(&text).map_err(|e| format!("конфиг {} повреждён: {}", path.display(), toml_error_brief(&text, &e)))
 }
 
 pub fn save_config(cfg: &Config) -> anyhow::Result<()> {
@@ -288,12 +305,58 @@ pub fn save_state(state: &State) -> anyhow::Result<()> {
     write_atomic(&state_path(), &toml::to_string_pretty(state)?)
 }
 
+/// Краткое описание ошибки разбора TOML: сообщение, строка и столбец. Исходный текст строки
+/// в сообщение не попадает (в конфиге может быть токен API).
+pub fn toml_error_brief(text: &str, e: &toml::de::Error) -> String {
+    match e.span() {
+        Some(span) => {
+            let start = span.start.min(text.len());
+            let before = &text.as_bytes()[..start];
+            let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+            let col = start - before.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) + 1;
+            format!("{} (строка {line}, столбец {col})", redact(e.message()))
+        }
+        None => redact(e.message()),
+    }
+}
+
+/// serde вставляет в сообщения само значение (`invalid type: string "…"`): прячем всё в кавычках.
+fn redact(msg: &str) -> String {
+    let mut out = String::new();
+    let mut close: Option<char> = None;
+    for c in msg.chars() {
+        match close {
+            Some(q) if c == q => close = None,
+            Some(_) => {}
+            None if c == '"' || c == '`' => {
+                out.push(c);
+                out.push('…');
+                out.push(c);
+                close = Some(c);
+            }
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// Записывает файл; на Unix создаёт его с правами 0600 (в конфиге лежит токен).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(bytes)
+}
+
 fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
+    let _ = std::fs::remove_file(&tmp);
+    write_private(&tmp, contents.as_bytes())?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -332,14 +395,17 @@ pub fn expand_env(s: &str) -> String {
 // Default presets, built from programs found on this machine.
 // ---------------------------------------------------------------------------
 
+#[cfg(windows)]
 fn env_path(var: &str) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or_default()
 }
 
+#[cfg(windows)]
 fn first_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+#[cfg(windows)]
 /// Finds a JetBrains IDE launcher (Toolbox or standalone installs).
 fn find_jetbrains(dir_prefix: &str, exe: &str) -> Option<PathBuf> {
     let mut candidates = Vec::new();
@@ -394,6 +460,7 @@ fn steam_exe_from_registry() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+#[cfg(windows)]
 fn entry(name: &str, path: Option<PathBuf>, fallback: &str) -> AppEntry {
     AppEntry {
         enabled: path.is_some(),
@@ -403,6 +470,7 @@ fn entry(name: &str, path: Option<PathBuf>, fallback: &str) -> AppEntry {
     }
 }
 
+#[cfg(windows)]
 pub fn default_config() -> Config {
     let local = env_path("LOCALAPPDATA");
     let roaming = env_path("APPDATA");
@@ -452,10 +520,7 @@ pub fn default_config() -> Config {
         ..Default::default()
     };
 
-    #[cfg(windows)]
     let steam_reg = steam_exe_from_registry();
-    #[cfg(not(windows))]
-    let steam_reg: Option<PathBuf> = None;
     let steam_path = steam_reg.or_else(|| first_existing([pf86.join("Steam\\steam.exe"), pf.join("Steam\\steam.exe")]));
     let mut steam = entry("Steam", steam_path, "C:\\Program Files (x86)\\Steam\\steam.exe");
     steam.close_command = format!("\"{}\" -shutdown", steam.path);
@@ -466,6 +531,33 @@ pub fn default_config() -> Config {
         presets: vec![
             Preset::new("Работа", vec![rider, datagrip, browser, telegram, terminal]),
             Preset::new("Игры", vec![discord, steam]),
+        ],
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn default_config() -> Config {
+    let app = |name: &str, path: &str| AppEntry {
+        enabled: Path::new(path).exists(),
+        name: name.into(),
+        path: path.into(),
+        ..Default::default()
+    };
+    let mut steam = app("Steam", "/Applications/Steam.app");
+    steam.delay_ms = 1000;
+    Config {
+        settings: Settings::default(),
+        presets: vec![
+            Preset::new(
+                "Работа",
+                vec![
+                    app("Visual Studio Code", "/Applications/Visual Studio Code.app"),
+                    app("Safari", "/Applications/Safari.app"),
+                    app("Telegram", "/Applications/Telegram.app"),
+                    app("Терминал", "/System/Applications/Utilities/Terminal.app"),
+                ],
+            ),
+            Preset::new("Игры", vec![app("Discord", "/Applications/Discord.app"), steam]),
         ],
     }
 }
@@ -485,9 +577,12 @@ mod tests {
 
     #[test]
     fn process_name_derivation() {
-        let mut e = AppEntry { path: "C:\\x\\Foo.EXE".into(), ..Default::default() };
-        assert_eq!(e.effective_process_name().as_deref(), Some("foo.exe"));
-        e.process_name = "Bar.exe".into();
+        #[cfg(windows)]
+        {
+            let e = AppEntry { path: "C:\\x\\Foo.EXE".into(), ..Default::default() };
+            assert_eq!(e.effective_process_name().as_deref(), Some("foo.exe"));
+        }
+        let e = AppEntry { process_name: "Bar.exe".into(), ..Default::default() };
         assert_eq!(e.effective_process_name().as_deref(), Some("bar.exe"));
         let u = AppEntry { path: "steam://open/games".into(), ..Default::default() };
         assert_eq!(u.effective_process_name(), None);
@@ -548,6 +643,16 @@ hotkey = "Ctrl+Alt+1"
         let bad: Config = toml::from_str("[settings]\ntheme = \"neon\"\nlog_level = \"trace\"\n").unwrap();
         assert_eq!(bad.settings.theme, ThemeChoice::System);
         assert_eq!(bad.settings.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn toml_errors_do_not_leak_values() {
+        for text in ["[settings]\napi_port = \"supersecret\"\n", "[settings]\napi_token = 987654321\n", "[settings]\napi_token = \"supersecret\n"] {
+            let e = toml::from_str::<Config>(text).unwrap_err();
+            let brief = toml_error_brief(text, &e);
+            assert!(!brief.contains("supersecret") && !brief.contains("987654321"), "{brief}");
+            assert!(brief.contains("строка 2"), "{brief}");
+        }
     }
 
     #[test]

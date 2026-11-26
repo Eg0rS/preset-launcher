@@ -2,9 +2,26 @@
 
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/).
 
-## [0.4.0] - не выпущена
+## [0.5.0]
 
-<!-- TODO -->
+### Добавлено
+- Сборка для macOS (universal `.app`): процессы через NSRunningApplication, питание через `pmset`/System Events,
+  громкость и уведомления через `osascript`, медиаклавиши, автозапуск через LaunchAgent.
+- CLI: `switch`, `status`, `list` (управляют запущенным экземпляром через локальный API), `autostart` на macOS.
+- Siri через «Быстрые команды» (docs/SIRI.md).
+- GitHub Actions: CI для Windows и macOS, релиз по тегу `v*` (установщик Windows и zip для macOS).
+
+### Изменено
+- Платформенный код вынесен в `src/platform/{win,mac}`; на macOS неподдерживаемые действия API отвечают `501`.
+
+## [0.4.0]
+
+### Добавлено
+- Тема окна (системная / светлая / тёмная) и цвет акцента.
+- Иконка и цвет у пресета: в списке и в меню трея.
+- Глобальные горячие клавиши пресетов (по умолчанию выключены).
+- Уровни журнала `error` / `info` / `debug`, кнопка «Открыть журнал», ротация `launcher.log` по 1 МБ.
+- В журнале уровня `debug` — каждый HTTP-запрос API (без токена и тела).
 
 ## [0.3.0]
 
@@ -36,7 +53,6 @@
 - Запуск `--autostart` (свёрнутым, со стартовым пресетом), `--preset NAME`, один экземпляр приложения.
 - Установщик Inno Setup (установка для пользователя без прав администратора, автозапуск).
 
-[0.4.0]: https://github.com/Eg0rS/preset-launcher/compare/v0.3.0...HEAD
+[0.5.0]: https://github.com/Eg0rS/preset-launcher/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Eg0rS/preset-launcher/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Eg0rS/preset-launcher/releases/tag/v0.3.0
-[0.2.0]: https://github.com/Eg0rS/preset-launcher/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Eg0rS/preset-launcher/releases/tag/v0.1.0

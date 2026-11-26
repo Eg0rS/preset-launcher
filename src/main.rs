@@ -1,17 +1,16 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod api;
 mod config;
 mod engine;
 mod hotkeys;
 mod icon_art;
+mod cli;
 mod logging;
-mod single;
+mod platform;
 mod theme;
 mod tray;
 mod ui;
-mod winproc;
-mod winsys;
 
 use std::sync::mpsc::channel;
 
@@ -19,29 +18,38 @@ use eframe::egui;
 
 const TITLE: &str = "Preset Launcher";
 
-fn setup_style(ctx: &egui::Context) {
-    // Segoe UI for a native look (falls back to egui's bundled fonts, which also cover Cyrillic).
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-    if let Ok(bytes) = std::fs::read(format!("{windir}\\Fonts\\segoeui.ttf")) {
-        ctx.add_font(egui::epaint::text::FontInsert::new(
-            "segoe-ui",
-            egui::FontData::from_owned(bytes),
-            vec![egui::epaint::text::InsertFontFamily {
-                family: egui::FontFamily::Proportional,
-                priority: egui::epaint::text::FontPriority::Highest,
-            }],
-        ));
+/// Системный шрифт, если файл есть: (имя, путь, приоритет в семействе Proportional).
+fn system_fonts() -> Vec<(&'static str, String, egui::epaint::text::FontPriority)> {
+    use egui::epaint::text::FontPriority::Lowest;
+    #[cfg(windows)]
+    use egui::epaint::text::FontPriority::Highest;
+    #[cfg(windows)]
+    {
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        vec![
+            // Segoe UI for a native look (falls back to egui's bundled fonts, which also cover Cyrillic).
+            ("segoe-ui", format!(r"{windir}\Fonts\segoeui.ttf"), Highest),
+            // Segoe UI lacks symbols like ▶ ✕ — use Segoe UI Symbol as a last-resort fallback.
+            ("segoe-ui-symbol", format!(r"{windir}\Fonts\seguisym.ttf"), Lowest),
+        ]
     }
-    // Segoe UI lacks symbols like ▶ ✕ — use Segoe UI Symbol as a last-resort fallback.
-    if let Ok(bytes) = std::fs::read(format!("{windir}\\Fonts\\seguisym.ttf")) {
-        ctx.add_font(egui::epaint::text::FontInsert::new(
-            "segoe-ui-symbol",
-            egui::FontData::from_owned(bytes),
-            vec![egui::epaint::text::InsertFontFamily {
-                family: egui::FontFamily::Proportional,
-                priority: egui::epaint::text::FontPriority::Lowest,
-            }],
-        ));
+    #[cfg(target_os = "macos")]
+    {
+        // Основной шрифт — встроенный egui (покрывает кириллицу); системный SF недоступен как .ttf.
+        // Apple Symbols — запасной для символов вроде ▶ ✕.
+        vec![("apple-symbols", "/System/Library/Fonts/Apple Symbols.ttf".to_string(), Lowest)]
+    }
+}
+
+fn setup_style(ctx: &egui::Context) {
+    for (name, path, priority) in system_fonts() {
+        if let Ok(bytes) = std::fs::read(&path) {
+            ctx.add_font(egui::epaint::text::FontInsert::new(
+                name,
+                egui::FontData::from_owned(bytes),
+                vec![egui::epaint::text::InsertFontFamily { family: egui::FontFamily::Proportional, priority }],
+            ));
+        }
     }
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -53,21 +61,34 @@ fn setup_style(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let autostart = args.iter().any(|a| a == "--autostart");
-    let preset_arg = args.iter().position(|a| a == "--preset").and_then(|i| args.get(i + 1)).cloned();
-    let minimized = autostart || preset_arg.is_some() || args.iter().any(|a| a == "--minimized");
+    let args = cli::collect_args().unwrap_or_else(|e| std::process::exit(cli::usage_error(&e)));
+    let cli::GuiArgs { autostart, minimized, preset: preset_arg } = match cli::route(&args) {
+        cli::Route::Gui(g) => g,
+        cli::Route::Cli(cmd) => std::process::exit(cli::execute(cmd)),
+        cli::Route::Usage(e) => std::process::exit(cli::usage_error(&e)),
+    };
 
-    let Some(instance) = single::acquire() else {
+    let before_lock = std::time::SystemTime::now();
+    let instance = match platform::acquire() {
+        platform::Acquire::Got(i) => i,
+        platform::Acquire::Failed(msg) => {
+            // Без защиты от второго экземпляра не запускаемся; консоли нет — пишем в журнал.
+            let msg = format!("Не удалось защититься от второго запуска: {msg}");
+            logging::append_to_file(&logging::format_line(&logging::timestamp(), logging::Level::Error, &msg));
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+        platform::Acquire::AlreadyRunning => {
         // Already running: hand over the request (switch preset or just show the window).
         if let Some(name) = &preset_arg {
             let _ = config::write_pending_switch(name);
         }
-        single::signal_existing();
+        platform::signal_existing();
         return Ok(());
+        }
     };
-    // Drop a stale request left over from a previous run.
-    let _ = config::take_pending_switch();
+    // Drop a stale request left over from a previous run (but keep one written after our start).
+    config::discard_pending_switch_older_than(before_lock);
 
     let (mut cfg, load_error) = config::load_config();
     if cfg.settings.api_enabled && cfg.settings.api_token.trim().is_empty() {
@@ -107,8 +128,9 @@ fn main() -> eframe::Result {
                     ctx.request_repaint();
                 });
             }
-            // `Instance` holds raw HANDLEs without Drop: the singleton mutex stays
-            // owned for the whole process lifetime.
+            // Блокировка single-instance (mutex на Windows, flock на macOS) должна жить весь
+            // процесс: `Instance` намеренно не освобождается.
+            Box::leak(Box::new(instance));
 
             let repaint_ctx = cc.egui_ctx.clone();
             let engine = engine::Engine::start(cfg.clone(), move || repaint_ctx.request_repaint());

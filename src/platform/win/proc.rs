@@ -30,13 +30,14 @@ pub fn is_protected(process_name: &str) -> bool {
     PROTECTED.contains(&process_name)
 }
 
-/// Returns `lowercase image name -> pids` for all running processes (except ourselves).
-pub fn snapshot() -> HashMap<String, Vec<u32>> {
+/// Returns `lowercase image name -> pids` for all running processes (except ourselves);
+/// `None` if the process list could not be obtained.
+pub fn snapshot() -> Option<HashMap<String, Vec<u32>>> {
     let mut map: HashMap<String, Vec<u32>> = HashMap::new();
     let me = std::process::id();
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return map;
+            return None;
         };
         let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
         let mut ok = Process32FirstW(snap, &mut entry).is_ok();
@@ -50,7 +51,7 @@ pub fn snapshot() -> HashMap<String, Vec<u32>> {
         }
         let _ = CloseHandle(snap);
     }
-    map
+    Some(map)
 }
 
 struct EnumCtx {

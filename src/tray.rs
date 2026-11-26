@@ -51,6 +51,7 @@ pub fn install_handlers(tx: Sender<UiEvent>, ctx: egui::Context) {
     }));
 }
 
+#[cfg(windows)]
 fn load_icon() -> Option<Icon> {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SM_CYSMICON};
     // Resource #1 is the .ico embedded by build.rs; ask for the DPI-correct small size.
@@ -59,6 +60,12 @@ fn load_icon() -> Option<Icon> {
     Icon::from_resource(1, Some(size))
         .ok()
         .or_else(|| Icon::from_rgba(crate::icon_art::render_icon_rgba(32), 32, 32).ok())
+}
+
+/// macOS: значок строки меню (22 pt, рисуем 44 px для Retina).
+#[cfg(target_os = "macos")]
+fn load_icon() -> Option<Icon> {
+    Icon::from_rgba(crate::icon_art::render_icon_rgba(44), 44, 44).ok()
 }
 
 /// Подпись пункта меню: иконка пресета (если есть) перед названием.

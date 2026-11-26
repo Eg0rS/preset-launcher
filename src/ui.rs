@@ -13,7 +13,7 @@ use crate::hotkeys::{self, Hotkeys};
 use crate::logging::{self, Level};
 use crate::theme;
 use crate::tray::{Tray, UiEvent};
-use crate::winproc;
+use crate::platform;
 
 const GREEN: Color32 = Color32::from_rgb(0x3c, 0xc8, 0x8a);
 const AMBER: Color32 = Color32::from_rgb(0xe8, 0xa8, 0x3a);
@@ -134,7 +134,7 @@ impl LauncherApp {
     fn refresh_running(&mut self) {
         let stale = self.running_checked.map(|t| t.elapsed() > Duration::from_secs(2)).unwrap_or(true);
         if stale {
-            self.running = winproc::snapshot().into_keys().collect();
+            self.running = platform::snapshot().unwrap_or_default().into_keys().collect();
             self.running_checked = Some(Instant::now());
         }
     }
@@ -321,7 +321,7 @@ impl LauncherApp {
                 if ui.button("+ Добавить программу…").clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .set_title("Выберите программу")
-                        .add_filter("Программы и ярлыки", &["exe", "lnk", "bat", "cmd", "url"])
+                        .add_filter("Программы и ярлыки", platform::PROGRAM_EXTENSIONS)
                         .add_filter("Все файлы", &["*"])
                         .pick_file()
                     {
@@ -505,7 +505,7 @@ impl LauncherApp {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Папка конфига").on_hover_text(config::app_dir().display().to_string()).clicked() {
-                    let _ = winproc::launch("explorer.exe", &format!("\"{}\"", config::app_dir().display()), "");
+                    let _ = platform::open_path(&config::app_dir());
                 }
             });
         });
@@ -528,7 +528,7 @@ impl LauncherApp {
             });
             if ui.button("Открыть журнал").on_hover_text(logging::log_path().display().to_string()).clicked() {
                 let path = logging::ensure_log_file();
-                if let Err(e) = winproc::launch(&path.to_string_lossy(), "", "") {
+                if let Err(e) = platform::open_path(&path) {
                     self.engine.log_error(format!("Не удалось открыть журнал: {e}"));
                 }
             }
@@ -598,10 +598,10 @@ fn app_card(ui: &mut egui::Ui, app: &mut AppEntry, i: usize, count: usize, runni
             ui.add(
                 egui::TextEdit::singleline(&mut app.path)
                     .desired_width((ui.available_width() - 70.0).max(120.0))
-                    .hint_text("C:\\…\\program.exe, ярлык или URL"),
+                    .hint_text(platform::PATH_HINT),
             );
             if ui.button("Обзор").clicked()
-                && let Some(p) = rfd::FileDialog::new().add_filter("Программы", &["exe", "lnk", "bat", "cmd"]).pick_file() {
+                && let Some(p) = rfd::FileDialog::new().add_filter("Программы", platform::PROGRAM_EXTENSIONS).pick_file() {
                     app.path = p.to_string_lossy().into_owned();
                 }
         });
@@ -611,7 +611,7 @@ fn app_card(ui: &mut egui::Ui, app: &mut AppEntry, i: usize, count: usize, runni
         ui.add(
             egui::TextEdit::singleline(&mut app.args)
                 .desired_width(f32::INFINITY)
-                .hint_text("например: --new-window https://… или -d C:\\work"),
+                .hint_text(platform::ARGS_HINT),
         );
         ui.end_row();
 
@@ -633,7 +633,7 @@ fn app_card(ui: &mut egui::Ui, app: &mut AppEntry, i: usize, count: usize, runni
     egui::CollapsingHeader::new("Дополнительно").id_salt(("app_more", preset_idx, i)).show(ui, |ui| {
         egui::Grid::new(("app_more_grid", preset_idx, i)).num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
             ui.label("Имя процесса");
-            let hint = app.effective_process_name().unwrap_or_else(|| "напр. Discord.exe".into());
+            let hint = app.effective_process_name().unwrap_or_else(|| platform::PROCESS_HINT.into());
             ui.add(egui::TextEdit::singleline(&mut app.process_name).desired_width(220.0).hint_text(hint))
                 .on_hover_text("По нему программа определяется как запущенная и закрывается. Пусто — имя файла из пути.");
             ui.end_row();
@@ -646,7 +646,7 @@ fn app_card(ui: &mut egui::Ui, app: &mut AppEntry, i: usize, count: usize, runni
             ui.add(
                 egui::TextEdit::singleline(&mut app.close_command)
                     .desired_width(f32::INFINITY)
-                    .hint_text("вместо закрытия окон, напр. \"C:\\Steam\\steam.exe\" -shutdown"),
+                    .hint_text(platform::CLOSE_COMMAND_HINT),
             );
             ui.end_row();
         });

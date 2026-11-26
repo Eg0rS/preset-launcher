@@ -65,6 +65,8 @@ fn main() {
         let _ = std::fs::copy(&ico, installer_dir.join("app.ico"));
     }
 
+    // winresource есть в build-зависимостях только на Windows-хосте.
+    #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon(ico.to_str().unwrap());

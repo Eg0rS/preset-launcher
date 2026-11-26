@@ -8,20 +8,27 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
 use windows::core::w;
 
+use crate::platform::Acquire;
+
 pub struct Instance {
     _mutex: HANDLE,
     show_event: HANDLE,
 }
 
-/// Returns `None` if another instance is already running.
-pub fn acquire() -> Option<Instance> {
+/// Takes the singleton mutex; reports if another instance already runs or the guard failed.
+pub fn acquire() -> Acquire {
     unsafe {
-        let mutex = CreateMutexW(None, false, w!("Local\\PresetLauncher.Singleton")).ok()?;
+        let mutex = match CreateMutexW(None, false, w!("Local\\PresetLauncher.Singleton")) {
+            Ok(m) => m,
+            Err(e) => return Acquire::Failed(format!("CreateMutex: {e}")),
+        };
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            return None;
+            return Acquire::AlreadyRunning;
         }
-        let show_event = CreateEventW(None, false, false, w!("Local\\PresetLauncher.Show")).ok()?;
-        Some(Instance { _mutex: mutex, show_event })
+        match CreateEventW(None, false, false, w!("Local\\PresetLauncher.Show")) {
+            Ok(show_event) => Acquire::Got(Instance { _mutex: mutex, show_event }),
+            Err(e) => Acquire::Failed(format!("CreateEvent: {e}")),
+        }
     }
 }
 

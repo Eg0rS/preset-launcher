@@ -1,0 +1,90 @@
+name: Release
+
+# Запускается при публикации тега вида v0.5.0 (версия тега должна совпадать с Cargo.toml).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  windows:
+    name: Установщик Windows
+    needs: checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      # build-installer.ps1: cargo build --release + ISCC (ищет Inno Setup 6 в Program Files).
+      - name: Сборка установщика
+        shell: pwsh
+        run: ./build-installer.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows
+          path: installer/Output/PresetLauncher-Setup-*.exe
+          if-no-files-found: error
+
+  macos:
+    name: Приложение macOS
+    needs: checks
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Сборка .app и zip
+        # RELEASE=1: обе архитектуры обязательны, lipo -verify_arch в конце.
+        run: RELEASE=1 bash scripts/bundle-macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-macos
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [checks, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версия тега совпадает с Cargo.toml
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Тег ${GITHUB_REF_NAME} не совпадает с версией в Cargo.toml (${cargo_version})" >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Список файлов
+        run: ls -l artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/PresetLauncher-Setup-*.exe
+            artifacts/PresetLauncher-*-macos.zip
+          generate_release_notes: true

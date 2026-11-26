@@ -100,11 +100,15 @@ pub trait Backend: Send + Sync {
     /// Ставит действие питания через `delay_secs` (0 — выполнить сразу), заменяя ожидающее.
     /// `Err` — если команду поставить/выполнить не удалось.
     fn power(&self, action: PowerAction, delay_secs: u64) -> Result<(), String>;
+    /// Поддерживает ли ОС действие питания (иначе API отвечает 501, не ставя таймер).
+    fn power_supported(&self, _action: PowerAction) -> bool {
+        true
+    }
     /// Отменяет ожидающее действие питания; true, если оно действительно ожидало.
     fn cancel_shutdown(&self) -> bool;
     /// Какое действие питания ожидает исполнения.
     fn pending_power(&self) -> Option<PowerAction>;
-    /// Громкость 0–100 и mute основного устройства; `None` — ошибка Core Audio.
+    /// Громкость 0–100 и mute основного устройства; `None` — ошибка получения громкости.
     fn volume(&self) -> Option<(u8, bool)>;
     /// Применяет изменение и возвращает итоговые (громкость, mute).
     fn set_volume(&self, change: VolumeChange) -> Result<(u8, bool), String>;
@@ -129,6 +133,9 @@ impl Backend for Engine {
     fn power(&self, action: PowerAction, delay_secs: u64) -> Result<(), String> {
         self.shutdown.schedule_after(action, Duration::from_secs(delay_secs))
     }
+    fn power_supported(&self, action: PowerAction) -> bool {
+        crate::platform::power_supported(action)
+    }
     fn cancel_shutdown(&self) -> bool {
         self.shutdown.cancel()
     }
@@ -136,23 +143,23 @@ impl Backend for Engine {
         self.shutdown.pending_action()
     }
     fn volume(&self) -> Option<(u8, bool)> {
-        crate::winsys::get_volume().ok()
+        crate::platform::get_volume().ok()
     }
     fn set_volume(&self, change: VolumeChange) -> Result<(u8, bool), String> {
-        crate::winsys::set_volume(change)
+        crate::platform::set_volume(change)
     }
     fn media(&self, key: MediaKey) -> Result<(), String> {
-        crate::winsys::send_media_key(key)
+        crate::platform::send_media_key(key)
     }
     fn notify(&self, title: &str, message: &str) -> Result<(), String> {
         // Тост показывается в фоне: ответ 202 уходит сразу, ошибка показа — только в журнал.
-        let _slot = crate::winsys::acquire_toast_slot().ok_or_else(|| NOTIFY_BUSY.to_string())?;
+        let _slot = crate::platform::acquire_toast_slot().ok_or_else(|| NOTIFY_BUSY.to_string())?;
         let (title, message, engine) = (title.to_string(), message.to_string(), self.clone());
         std::thread::Builder::new()
             .name("preset-toast".into())
             .spawn(move || {
                 let _slot = _slot;
-                if let Err(e) = crate::winsys::show_toast(&title, &message) {
+                if let Err(e) = crate::platform::show_toast(&title, &message) {
                     Engine::log_error(&engine, format!("API: уведомление не показано — {e}"));
                 }
             })
@@ -174,8 +181,11 @@ pub type LogFn = Arc<dyn Fn(Level, &str) + Send + Sync>;
 /// Значение `Err` из `Backend::notify`, означающее «слишком много показов тостов сразу» (-> 503).
 pub const NOTIFY_BUSY: &str = "busy";
 
+/// Значение `Err` из `Backend`, означающее «действие не поддерживается на этой ОС» (-> 501).
+pub const UNSUPPORTED: &str = "unsupported";
+
 /// Отложенное действие питания (одно ожидающее; новое заменяет старое).
-/// Задержка отсчитывается здесь, а не в `shutdown.exe`, поэтому её можно отменить.
+/// Задержка отсчитывается здесь, а не в системной команде, поэтому её можно отменить.
 pub struct ShutdownTimer {
     /// (id, дедлайн, действие) ожидающего действия.
     pending: Arc<Mutex<Option<(u64, Instant, PowerAction)>>>,
@@ -245,9 +255,9 @@ fn run_exec(exec: &ExecFn, log: &LogFn, action: PowerAction) -> Result<(), Strin
     match exec(action) {
         Ok(()) => {
             if action == PowerAction::Shutdown {
-                log(Level::Info, "API: shutdown.exe /s /t 0 выполнен, ПК выключается");
+                log(Level::Info, "API: команда выключения выполнена, ПК выключается");
             } else if matches!(action, PowerAction::Sleep | PowerAction::Hibernate) {
-                // Итог SetSuspendState пишет сам поток в winsys (после пробуждения).
+                // Итог сна пишет сам поток в platform (после пробуждения).
                 log(Level::Info, &format!("API: действие питания «{}» запущено", action.name()));
             } else {
                 log(Level::Info, &format!("API: действие питания «{}» выполнено", action.name()));
@@ -343,9 +353,13 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
         }
         ("POST", "/api/shutdown") => {
             let Some(delay) = parse_shutdown_delay(req.body) else { return err(400, "bad request") };
+            if !backend.power_supported(PowerAction::Shutdown) {
+                return err(501, "not supported");
+            }
             backend.log(Level::Info, &format!("API: запрошено выключение ПК через {delay} с"));
             match backend.power(PowerAction::Shutdown, delay) {
                 Ok(()) => resp(202, json!({ "accepted": true, "delay_secs": delay })),
+                Err(e) if e == UNSUPPORTED => err(501, "not supported"),
                 Err(e) => {
                     backend.log(Level::Error, &format!("API: выключение не выполнено — {e}"));
                     err(500, "shutdown failed")
@@ -354,9 +368,13 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
         }
         ("POST", "/api/power") => {
             let Some((action, delay)) = parse_power(req.body) else { return err(400, "bad request") };
+            if !backend.power_supported(action) {
+                return err(501, "not supported");
+            }
             backend.log(Level::Info, &format!("API: запрошено действие питания «{}» через {delay} с", action.name()));
             match backend.power(action, delay) {
                 Ok(()) => resp(202, json!({ "accepted": true, "action": action.name(), "delay_secs": delay })),
+                Err(e) if e == UNSUPPORTED => err(501, "not supported"),
                 Err(e) => {
                     backend.log(Level::Error, &format!("API: действие питания «{}» не выполнено — {e}", action.name()));
                     err(500, "power failed")
@@ -374,6 +392,7 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
             let Some(change) = parse_volume(req.body) else { return err(400, "bad request") };
             match backend.set_volume(change) {
                 Ok((volume, muted)) => resp(200, json!({ "volume": volume, "muted": muted })),
+                Err(e) if e == UNSUPPORTED => err(501, "not supported"),
                 Err(e) => {
                     backend.log(Level::Error, &format!("API: громкость не изменена — {e}"));
                     err(500, "volume failed")
@@ -384,6 +403,7 @@ pub fn handle(req: &Request, token: &str, backend: &dyn Backend) -> Response {
             let Some(key) = parse_media(req.body) else { return err(400, "bad request") };
             match backend.media(key) {
                 Ok(()) => resp(200, json!({ "ok": true })),
+                Err(e) if e == UNSUPPORTED => err(501, "not supported"),
                 Err(e) => {
                     backend.log(Level::Error, &format!("API: медиаклавиша не отправлена — {e}"));
                     err(500, "media failed")
@@ -706,6 +726,8 @@ mod tests {
         volume_calls: Mutex<Vec<VolumeChange>>,
         media_calls: Mutex<Vec<MediaKey>>,
         notifications: Mutex<Vec<(String, String)>>,
+        /// Имитация macOS: нет hibernate и media stop.
+        mac_like: AtomicBool,
         fail_misc: AtomicBool,
     }
 
@@ -739,6 +761,9 @@ mod tests {
             *self.pending.lock().unwrap() = (d > 0).then_some(a);
             Ok(())
         }
+        fn power_supported(&self, a: PowerAction) -> bool {
+            !(self.mac_like.load(Ordering::SeqCst) && a == PowerAction::Hibernate)
+        }
         fn cancel_shutdown(&self) -> bool {
             self.pending.lock().unwrap().take().is_some()
         }
@@ -758,6 +783,9 @@ mod tests {
         }
         fn media(&self, k: MediaKey) -> Result<(), String> {
             self.media_calls.lock().unwrap().push(k);
+            if self.mac_like.load(Ordering::SeqCst) && k == MediaKey::Stop {
+                return Err(UNSUPPORTED.into());
+            }
             if self.fail_misc.load(Ordering::SeqCst) { Err("boom".into()) } else { Ok(()) }
         }
         fn notify(&self, t: &str, m: &str) -> Result<(), String> {
@@ -915,7 +943,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert!(t.pending_action().is_none());
         assert!(!t.cancel());
-        assert!(logs.lock().unwrap().iter().any(|m| m.contains("/t 0")));
+        assert!(logs.lock().unwrap().iter().any(|m| m.contains("команда выключения")));
     }
 
     #[test]
@@ -1091,6 +1119,22 @@ mod tests {
         assert_eq!(apply_volume((50, true), c(None, Some(-20), None)), (30, true));
         assert_eq!(apply_volume((95, false), c(None, Some(100), Some(true))), (100, true));
         assert_eq!(apply_volume((5, false), c(None, Some(-100), None)), (0, false));
+    }
+
+    #[test]
+    fn unsupported_actions_are_501() {
+        let f = Fake::default();
+        f.mac_like.store(true, Ordering::SeqCst);
+        let (s, b) = call(&f, "POST", "/api/power", OK, r#"{"action":"hibernate"}"#);
+        assert_eq!((s, b), (501, json!({"error": "not supported"})));
+        assert!(f.powers.lock().unwrap().is_empty());
+        let (s, _) = call(&f, "POST", "/api/media", OK, r#"{"action":"stop"}"#);
+        assert_eq!(s, 501);
+        // остальное работает
+        let (s, _) = call(&f, "POST", "/api/media", OK, r#"{"action":"next"}"#);
+        assert_eq!(s, 200);
+        let (s, _) = call(&f, "POST", "/api/power", OK, r#"{"action":"sleep"}"#);
+        assert_eq!(s, 202);
     }
 
     #[test]

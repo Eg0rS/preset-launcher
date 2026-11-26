@@ -85,20 +85,9 @@ pub fn format_line(time: &str, level: Level, msg: &str) -> String {
     format!("{time}{} {msg}", level.tag())
 }
 
-#[cfg(windows)]
 pub fn timestamp() -> String {
-    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond)
-}
-
-#[cfg(not(windows))]
-pub fn timestamp() -> String {
-    // Без платформенного API локального времени — UTC.
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+    let (h, m, s) = crate::platform::local_hms();
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 pub fn log_path() -> PathBuf {
@@ -124,14 +113,18 @@ pub fn ensure_log_file() -> PathBuf {
     path
 }
 
+/// Один мьютекс на проверку размера, ротацию и запись: потоки не гоняются за файл.
+static FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Ротация при старте приложения.
 pub fn rotate_on_start() {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     rotate_if_needed(&log_path(), MAX_LOG_BYTES);
 }
 
-#[cfg(not(test))]
 pub fn append_to_file(line: &str) {
     use std::io::Write;
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = log_path();
     rotate_if_needed(&path, MAX_LOG_BYTES);
     let _ = std::fs::create_dir_all(crate::config::app_dir());

@@ -40,6 +40,7 @@ Authorization: Bearer <токен>
 | `401` | `unauthorized` |
 | `404` | `unknown preset` (только `/api/switch`) или `not found` |
 | `500` | операция не удалась (`shutdown failed`, `power failed`, `volume failed`, `media failed`, `notify failed`); подробности в журнале |
+| `501` | `not supported`: действие не поддерживается на этой ОС (только macOS, см. ниже) |
 | `503` | `busy`: превышен лимит запросов или уведомлений |
 
 ## Эндпоинты
@@ -275,6 +276,21 @@ Invoke-RestMethod http://192.168.1.10:47800/api/notify -Method Post -Headers $h 
 ```
 
 Для кириллицы в PowerShell 5.1 передавайте тело байтами UTF-8, как в последнем примере; иначе возможна неверная кодировка.
+
+## Различия на macOS
+
+На macOS (см. [MACOS.md](MACOS.md)) API тот же, но часть действий не поддерживается. Такие запросы получают **`501 {"error":"not supported"}`**; задержка при этом не ставится.
+
+| Запрос | macOS |
+|---|---|
+| `POST /api/power` `{"action":"hibernate"}` | `501`: гибернации нет |
+| `POST /api/media` `{"action":"stop"}` | `501`: у macOS нет системной клавиши Stop |
+| `POST /api/shutdown`, `/api/power` (`restart`, `sleep`, `lock`) | работают: `osascript` (System Events), `pmset`; `lock` требует разрешений «Универсальный доступ» и «Автоматизация»; без них `500` (запасного гашения дисплея нет) |
+| `POST /api/media` (`play_pause`, `next`, `prev`) | системные media-события; без разрешения «Универсальный доступ» - `500` (подсказка в журнале) |
+| `POST /api/volume`, `GET /api/status` (громкость) | через `osascript`; у устройств без регулировки громкости (часть HDMI) вернётся `volume`: `null` в статусе и `500` при записи |
+| `POST /api/notify` | уведомление Центра уведомлений (показывается от имени «Редактора скриптов») |
+
+Остальное (`status`, `switch`, `shutdown/cancel`) без отличий.
 
 ## Интеграция с Home Assistant
 

@@ -7,7 +7,6 @@ use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eMultimedia, eRender};
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::Win32::System::Power::SetSuspendState;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
@@ -205,27 +204,6 @@ pub fn toast_xml(title: &str, message: &str) -> String {
         xml_escape(title),
         xml_escape(message)
     )
-}
-
-/// Максимум одновременно показываемых тостов (сверх — `/api/notify` отвечает 503).
-const MAX_TOASTS: usize = 4;
-static TOASTS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-
-/// Занятый слот показа тоста; освобождается при drop.
-pub struct ToastSlot(());
-
-impl Drop for ToastSlot {
-    fn drop(&mut self) {
-        TOASTS_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-pub fn acquire_toast_slot() -> Option<ToastSlot> {
-    if TOASTS_ACTIVE.fetch_add(1, Ordering::SeqCst) >= MAX_TOASTS {
-        TOASTS_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-        return None;
-    }
-    Some(ToastSlot(()))
 }
 
 /// Инициализация WinRT (MTA) в текущем потоке; `RoUninitialize` — при drop.
